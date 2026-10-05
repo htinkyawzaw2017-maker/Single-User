@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Single-User Burmese/English Movie Dubbing Tool — full stack:
+  S3 (input/output with lifecycle), ECR, RDS PostgreSQL, Secrets Manager,
+  ECS Fargate service behind an ALB, CloudWatch logs.
+
+  Deploy order (see infrastructure/deploy.sh for the automated path):
+    1. aws cloudformation deploy with ImageUrl=placeholder
+       → creates buckets, ECR repo, RDS, roles, ALB
+    2. docker build + push to the created ECR repo
+    3. aws cloudformation deploy again with ImageUrl=<ecr-uri>:latest
+       → creates/updates the ECS service
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the service (use the default VPC for the MVP)
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for ALB + ECS tasks (default VPC subnets are fine)
+  ImageUrl:
+    Type: String
+    Default: public.ecr.aws/docker/library/python:3.11-slim
+    Description: Container image (ECR URI). Placeholder on first pass.
+  AccessKey:
+    Type: String
+    NoEcho: true
+    Description: SINGLE_USER_ACCESS_KEY for the private app
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: RDS PostgreSQL master password
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  TranscriptionProvider:
+    Type: String
+    Default: mock
+    AllowedValues: [mock, aws]
+  TranslationProvider:
+    Type: String
+    Default: mock
+    AllowedValues: [mock, llm]
+  TtsProvider:
+    Type: String
+    Default: mock
+    AllowedValues: [mock, http]
+  LipSyncProvider:
+    Type: String
+    Default: mock
+    AllowedValues: [mock, sagemaker]
+  TtsHttpUrl:
+    Type: String
+    Default: ""
+  LlmBaseUrl:
+    Type: String
+    Default: ""
+  TaskCpu:
+    Type: Number
+    Default: 1024
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+  TaskMemory:
+    Type: Number
+    Default: 4096
+
+Resources:
+  # ─────────────────────────────── S3 ───────────────────────────────
+  InputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${AWS::StackName}-input"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-uploads
+            Status: Enabled
+            Transitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+              - { StorageClass: GLACIER, TransitionInDays: 90 }
+            ExpirationInDays: 365
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${AWS::StackName}-output"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-old-outputs
+            Status: Enabled
+            Transitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+              - { StorageClass: INTELLIGENT_TIERING, TransitionInDays: 90 }
+
+  # ─────────────────────────── Secrets ──────────────────────────────
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/app"
+      SecretString: !Sub >-
+        {
+          "DATABASE_URL": "postgresql+psycopg2-binary://dubbing:${DbPassword}@${RDS.Endpoint.Address}:${RDS.Endpoint.Port}/dubbing",
+          "SECRET_ID": "${AWS::StackName}/app"
+        }
+
+  # ────────────────────────────── RDS ───────────────────────────────
+  RDS:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-db"
+      DBName: dubbing
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      Engine: postgres
+      EngineVersion: "16.3"
+      MasterUsername: dubbing
+      MasterUserPassword: !Ref DbPassword
+      PubliclyAccessible: false
+      VPCSecurityGroups: [!GetAtt DatabaseSG.GroupId]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: default VPC subnets for the dubbing tool DB
+      SubnetIds: !Ref SubnetIds
+
+  # ───────────────────────── Security groups ────────────────────────
+  DatabaseSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS access from the ECS service only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !GetAtt ServiceSG.GroupId
+
+  ServiceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Dubbing tool app containers
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !GetAtt AlbSG.GroupId
+
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP for the dubbing tool ALB
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # ───────────────────────────── ALB ────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Split [",", !ImportValue "default-vpc-subnets"]
+      SecurityGroups: [!GetAtt AlbSG.GroupId]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ───────────────────────────── ECS ────────────────────────────────
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AWS::StackName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: pull-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: [!Ref AppSecret]
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: app-buckets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !Sub "${InputBucket.Arn}/*"
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub "${OutputBucket.Arn}/*"
+        - PolicyName: transcribe
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+                Resource: "*"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref AWS::StackName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ImageUrl
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - { Name: APP_ENV, Value: aws }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: STORAGE_BACKEND, Value: s3 }
+            - { Name: S3_INPUT_BUCKET, Value: !Ref InputBucket }
+            - { Name: S3_OUTPUT_BUCKET, Value: !Ref OutputBucket }
+            - { Name: SINGLE_USER_ACCESS_KEY, Value: !Ref AccessKey }
+            - { Name: TRANSCRIPTION_PROVIDER, Value: !Ref TranscriptionProvider }
+            - { Name: TRANSLATION_PROVIDER, Value: !Ref TranslationProvider }
+            - { Name: TTS_PROVIDER, Value: !Ref TtsProvider }
+            - { Name: LIPSYNC_PROVIDER, Value: !Ref LipSyncProvider }
+            - { Name: TTS_HTTP_URL, Value: !Ref TtsHttpUrl }
+            - { Name: LLM_BASE_URL, Value: !Ref LlmBaseUrl }
+            - { Name: DATABASE_URL, Value: !Sub "postgresql+psycopg2://dubbing:${DbPassword}@${RDS.Endpoint.Address}:${RDS.Endpoint.Port}/dubbing" }
+            - { Name: DATA_DIR, Value: /app/data }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener]
+    Properties:
+      ServiceName: !Ref AWS::StackName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Split [",", !ImportValue "default-vpc-subnets"]
+          SecurityGroups: [!GetAtt ServiceSG.GroupId]
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+Outputs:
+  AppUrl:
+    Description: Open this in the browser (use your access key to sign in)
+    Value: !Sub "http://${ALB.DNSName}"
+  InputBucket:
+    Value: !Ref InputBucket
+  OutputBucket:
+    Value: !Ref OutputBucket
+  EcrRepoUri:
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${Repository}"

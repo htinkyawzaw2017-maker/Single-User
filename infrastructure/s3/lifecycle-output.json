@@ -1,0 +1,14 @@
+{
+  "Rules": [
+    {
+      "ID": "archive-old-outputs",
+      "Filter": { "Prefix": "" },
+      "Status": "Enabled",
+      "Transitions": [
+        { "Days": 30, "StorageClass": "STANDARD_IA" },
+        { "Days": 90, "StorageClass": "INTELLIGENT_TIERING" }
+      ],
+      "Expiration": { "ExpiredObjectDeleteMarker": true }
+    }
+  ]
+}

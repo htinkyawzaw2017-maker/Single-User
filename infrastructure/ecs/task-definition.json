@@ -1,0 +1,47 @@
+{
+  "family": "my-dubbing-tool",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "1024",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/my-dubbing-tool-execution",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/my-dubbing-tool-task",
+  "containerDefinitions": [
+    {
+      "name": "app",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/my-dubbing-tool:latest",
+      "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
+      "essential": true,
+      "environment": [
+        { "name": "APP_ENV", "value": "aws" },
+        { "name": "AWS_REGION", "value": "<REGION>" },
+        { "name": "STORAGE_BACKEND", "value": "s3" },
+        { "name": "S3_INPUT_BUCKET", "value": "<INPUT_BUCKET>" },
+        { "name": "S3_OUTPUT_BUCKET", "value": "<OUTPUT_BUCKET>" },
+        { "name": "SINGLE_USER_ACCESS_KEY", "value": "<SET_A_STRONG_KEY>" },
+        { "name": "TRANSCRIPTION_PROVIDER", "value": "mock" },
+        { "name": "TRANSLATION_PROVIDER", "value": "mock" },
+        { "name": "TTS_PROVIDER", "value": "mock" },
+        { "name": "LIPSYNC_PROVIDER", "value": "mock" }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:my-dubbing-tool/db:DATABASE_URL"
+        },
+        {
+          "name": "SECRETS_MANAGER_SECRET_ID",
+          "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:my-dubbing-tool/app:SECRET_ID"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/my-dubbing-tool",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "app"
+        }
+      }
+    }
+  ]
+}
