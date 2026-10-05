@@ -1,0 +1,175 @@
+{
+  "Comment": "Single-User Dubbing Tool — production Step Functions orchestration (optional). The MVP ships with an equivalent in-app background worker (backend/app/runner.py); use this state machine when you outgrow it (multiple concurrent projects, GPU lip-sync fleets, etc.).",
+  "StartAt": "ValidateInput",
+  "States": {
+    "ValidateInput": {
+      "Type": "Task",
+      "Comment": "Lambda: check the uploaded object exists, size, mime type; write jobs row.",
+      "Resource": "${ValidateLambdaArn}",
+      "Retry": [
+        { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 2, "BackoffRate": 2 }
+      ],
+      "Next": "ExtractAudio",
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error" }
+      ]
+    },
+    "ExtractAudio": {
+      "Type": "Task",
+      "Comment": "ECS/Fargate RunTask: ffmpeg audio extraction (48k + 16k mono WAV).",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${EcsClusterArn}",
+        "LaunchType": "FARGATE",
+        "TaskDefinition": "${FfmpegTaskDef}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": { "Subnets": ["${SubnetIds}"], "AssignPublicIp": "ENABLED" }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "worker",
+              "Command": ["python", "-m", "app.worker", "extract-audio", "--project", "$.projectId"]
+            }
+          ]
+        }
+      },
+      "Next": "Transcribe",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error" }]
+    },
+    "Transcribe": {
+      "Type": "Task",
+      "Comment": "Amazon Transcribe job start (Lambda) + poll loop.",
+      "Resource": "${TranscribeLambdaArn}",
+      "Next": "TranslateRewrite",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error" }]
+    },
+    "TranslateRewrite": {
+      "Type": "Task",
+      "Comment": "Lambda/Bedrock: LLM translation + natural rewrite, batched per project.",
+      "Resource": "${TranslateLambdaArn}",
+      "Next": "WaitForUserReview",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error" }]
+    },
+    "WaitForUserReview": {
+      "Type": "Task",
+      "Comment": "Callback pattern: the web UI calls SendTaskSuccess after the user edits segments and clicks continue.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${ReviewCallbackLambdaArn}",
+        "Payload": { "projectId.$": "$.projectId", "taskToken.$": "$$.Task.Token" }
+      },
+      "TimeoutSeconds": 2592000,
+      "Next": "GenerateVoice",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkCancelled", "ResultPath": "$.error" }]
+    },
+    "GenerateVoice": {
+      "Type": "Map",
+      "Comment": "One TTS task per segment — a single failed segment is retried alone, never the whole project.",
+      "Iterator": {
+        "StartAt": "SynthesizeSegment",
+        "States": {
+          "SynthesizeSegment": {
+            "Type": "Task",
+            "Resource": "${TtsLambdaArn}",
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "End": true,
+            "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.segmentError", "Next": "RecordSegmentFailure" }]
+          },
+          "RecordSegmentFailure": {
+            "Type": "Task",
+            "Resource": "${MarkSegmentFailedLambdaArn}",
+            "End": true
+          }
+        }
+      },
+      "Next": "AlignTiming",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error" }]
+    },
+    "AlignTiming": {
+      "Type": "Task",
+      "Resource": "${AlignLambdaArn}",
+      "Next": "WaitForVoiceApproval",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error" }]
+    },
+    "WaitForVoiceApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${VoiceApprovalCallbackLambdaArn}",
+        "Payload": { "projectId.$": "$.projectId", "taskToken.$": "$$.Task.Token" }
+      },
+      "TimeoutSeconds": 2592000,
+      "Next": "LipSyncChoice",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkCancelled", "ResultPath": "$.error" }]
+    },
+    "LipSyncChoice": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.lipsyncEnabled", "BooleanEquals": true, "Next": "LipSyncPreview" }
+      ],
+      "Default": "RenderOutput"
+    },
+    "LipSyncPreview": {
+      "Type": "Task",
+      "Comment": "ECS GPU / SageMaker async endpoint: Wav2Lip-style preview for a 10-30s window. Failures fall through to audio-only rendering.",
+      "Resource": "arn:aws:states:::sagemaker:createTransformJob.sync",
+      "Next": "WaitForLipSyncApproval",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.lipsyncError", "Next": "RenderOutput" }]
+    },
+    "WaitForLipSyncApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${LipSyncCallbackLambdaArn}",
+        "Payload": { "projectId.$": "$.projectId", "taskToken.$": "$$.Task.Token" }
+      },
+      "TimeoutSeconds": 2592000,
+      "Next": "RenderOutput",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "RenderOutput", "ResultPath": "$.error" }]
+    },
+    "RenderOutput": {
+      "Type": "Task",
+      "Comment": "ECS/Fargate: ffmpeg mix + final MP4 + SRT/VTT to the output bucket.",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "Parameters": {
+        "Cluster": "${EcsClusterArn}",
+        "LaunchType": "FARGATE",
+        "TaskDefinition": "${FfmpegTaskDef}",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": { "Subnets": ["${SubnetIds}"], "AssignPublicIp": "ENABLED" }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "worker",
+              "Command": ["python", "-m", "app.worker", "render", "--project", "$.projectId"]
+            }
+          ]
+        }
+      },
+      "Next": "MarkCompleted",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed", "ResultPath": "$.error" }]
+    },
+    "MarkCompleted": {
+      "Type": "Task",
+      "Resource": "${StatusLambdaArn}",
+      "Parameters": { "projectId.$": "$.projectId", "status": "COMPLETED" },
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "${StatusLambdaArn}",
+      "Parameters": { "projectId.$": "$.projectId", "status": "FAILED", "error.$": "$.error" },
+      "End": true
+    },
+    "MarkCancelled": {
+      "Type": "Task",
+      "Resource": "${StatusLambdaArn}",
+      "Parameters": { "projectId.$": "$.projectId", "status": "CANCELLED" },
+      "End": true
+    }
+  }
+}

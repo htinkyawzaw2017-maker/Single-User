@@ -1,0 +1,73 @@
+# Optional GPU lip-sync endpoint (beta feature).
+#
+# Deploy a Wav2Lip/SadTalker-style model as a SageMaker Asynchronous
+# Inference endpoint, then set on the app task definition:
+#   LIPSYNC_PROVIDER=sagemaker
+#   LIPSYNC_ENDPOINT_NAME=<EndpointName from this stack>
+#
+# The adapter lives in backend/app/services/lipsync/sagemaker.py
+# (wire the polling/result-download to your model's contract).
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Optional - async GPU lip-sync endpoint for the dubbing tool
+
+Parameters:
+  ModelDataUrl:
+    Type: String
+    Description: s3://bucket/path/to/model.tar.gz (your Wav2Lip inference image + weights)
+  InstanceType:
+    Type: String
+    Default: ml.g4dn.xlarge
+    Description: GPU instance for lip-sync inference
+  MaxConcurrentTransforms:
+    Type: Number
+    Default: 1
+
+Resources:
+  LipSyncModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      PrimaryContainer:
+        ModelDataUrl: !Ref ModelDataUrl
+        Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/lipsync-inference:latest"
+      ExecutionRoleArn: !GetAtt LipSyncRole.Arn
+
+  LipSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: lipsync-s3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "arn:aws:s3:::${AWS::AccountId}-my-dubbing-tool-output/*"
+
+  LipSyncEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      ProductionVariants:
+        - InitialInstanceCount: 0
+          InstanceType: !Ref InstanceType
+          VariantName: primary
+          ModelName: !GetAtt LipSyncModel.ModelName
+      AsyncInferenceConfig:
+        OutputConfig:
+          S3OutputPath: !Sub "arn:aws:s3:::${AWS::AccountId}-my-dubbing-tool-output/lipsync-results"
+        ClientConfig:
+          MaxConcurrentInvocationsPerInstance: !Ref MaxConcurrentTransforms
+
+  LipSyncEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointConfigName: !GetAtt LipSyncEndpointConfig.EndpointConfigName
+
+Outputs:
+  EndpointName:
+    Value: !GetAtt LipSyncEndpoint.EndpointName
